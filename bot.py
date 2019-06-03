@@ -27,6 +27,7 @@ PROXY = {'proxy_url': 'socks5://t1.learn.python.ru:1080', 'urllib3_proxy_kwargs'
 
 def precalculate_optimal_model_params():
     features = pd.read_csv('mean_mels.tsv', index_col=0, sep='\t')
+    features /= np.linalg.norm(features, axis=1).reshape(-1, 1)
     audio_filenames = features.index.tolist()
     species_labels = [str(x).split('.')[0].split('-')[0]+'_' +str(x).split('.')[0].split('-')[1] for x in audio_filenames]
     features['label'] = species_labels
@@ -68,6 +69,7 @@ def get_predictions(models, filename):
     x, fs = librosa.load(filename)
     spec = librosa.feature.melspectrogram(x, sr=fs, n_mels=128)
     spec_mean = np.mean(spec, axis=1)
+    spec_mean /= np.linalg.norm(spec_mean)
     predictions = {}
     for bird, model in models.items():
         # 0-th sample, 1-st class - bird found (vs 0-th class "bird not found")

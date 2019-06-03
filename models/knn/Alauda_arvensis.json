@@ -1,1 +1,1 @@
-{"params": {"algorithm": "auto", "n_neighbors": 15, "weights": "uniform"}, "score": 0.5603629997004441}
+{"params": {"algorithm": "auto", "n_neighbors": 15, "weights": "distance"}, "score": 0.5165526473783868}
