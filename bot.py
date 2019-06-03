@@ -4,15 +4,78 @@ import requests
 import os, os.path
 import glob, random
 import re
+import librosa
 
-PROXY = {'proxy_url': 'socks5://t1.learn.python.ru:1080', 'urllib3_proxy_kwargs': {'username': 'learn', 'password': 'python'}}
+import json
+import numpy as np
+import pandas as pd
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score, matthews_corrcoef, confusion_matrix
+from sklearn.metrics import make_scorer
 
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import LabelEncoder
+from sklearn.model_selection import GridSearchCV, cross_val_score
 
 import logging
 logging.basicConfig(format='%(name)s - %(levelname)s - %(message)s',
                     level=logging.INFO,
-                    filename='bot.log'
-                    )
+                    filename='bot.log')
+
+PROXY = {'proxy_url': 'socks5://t1.learn.python.ru:1080', 'urllib3_proxy_kwargs': {'username': 'learn', 'password': 'python'}}
+
+
+def precalculate_optimal_model_params():
+    features = pd.read_csv('mean_mels.tsv', index_col=0, sep='\t')
+    audio_filenames = features.index.tolist()
+    species_labels = [str(x).split('.')[0].split('-')[0]+'_' +str(x).split('.')[0].split('-')[1] for x in audio_filenames]
+    features['label'] = species_labels
+    unlabelled_dataset = features.drop('label', axis=1)
+    species_types = set(species_labels)
+    for bird in species_types:
+        if not os.path.exists(f'models/knn/{bird}.json'):
+            labels = np.where(features['label'] == bird, 1, 0)
+            unlabelled_dataset = features.drop('label', axis=1)
+            model = KNeighborsClassifier()
+            params = {'n_neighbors': [1,3,5,7, 10, 15], 
+                  'weights':['uniform', 'distance'],
+                  'algorithm': ['auto', 'ball_tree', 'kd_tree', 'brute']}
+            grid_searcher = GridSearchCV(model, params, cv=3, n_jobs=12, verbose=True, scoring = 'precision', refit='precision')
+            grid_searcher.fit(unlabelled_dataset, labels)
+            with open(f'models/knn/{bird}.json', 'w+') as fw:
+                json.dump({'params': grid_searcher.best_params_, 'score': grid_searcher.best_score_}, fw)
+
+def load_models():
+    features = pd.read_csv('mean_mels.tsv', index_col=0, sep='\t')
+    audio_filenames = features.index.tolist()
+    species_labels = [str(x).split('.')[0].split('-')[0]+'_' +str(x).split('.')[0].split('-')[1] for x in audio_filenames]
+    features['label'] = species_labels
+    unlabelled_dataset = features.drop('label', axis=1)
+    species_types = set(species_labels)
+
+    models = {}
+    for bird in species_types:
+        labels = np.where(features['label'] == bird, 1, 0)
+        with open(f'models/knn/{bird}.json') as fw:
+            model_infos = json.load(fw)
+        params = model_infos['params']
+        model = KNeighborsClassifier(**params)
+        model.fit(unlabelled_dataset, labels)
+        models[bird] = model
+    return models
+
+def get_predictions(models, filename):
+    x, fs = librosa.load(filename)
+    spec = librosa.feature.melspectrogram(x, sr=fs, n_mels=128)
+    spec_mean = np.mean(spec, axis=1)
+    predictions = {}
+    for bird, model in models.items():
+        # 0-th sample, 1-st class - bird found (vs 0-th class "bird not found")
+        prob = model.predict_proba(spec_mean.reshape(1, -1))[0][1]
+        predictions[bird] = prob
+    return predictions
+
+
 
 def main():
     with open('key.txt') as f:
@@ -24,8 +87,7 @@ def main():
     dp.add_handler(CommandHandler("info", info_user, pass_user_data=True))
     dp.add_handler(MessageHandler(Filters.text, birdname, pass_user_data=True))
     dp.add_handler(MessageHandler(Filters.voice, receiveMessage, pass_user_data=True))
-    #dp.add_handler(MessageHandler(Filters.voice, trueMessage, pass_user_data=True))
-    #dp.add_handler(MessageHandler(Filters.all, countme))
+    dp.add_handler(MessageHandler(Filters.audio, receiveMessage, pass_user_data=True))
     mybot.start_polling()
     mybot.idle()
 
@@ -39,7 +101,6 @@ latin_names = {'зяблик': 'Fringilla-coelebs', 'fringilla coelebs': 'Fringi
     'снегирь': 'Pyrrhula-pyrrhula', 'pyrrhula pyrrhula': 'Pyrrhula-pyrrhula', 'поползень': 'Sitta-europaea', 'sitta europaea': 'Sitta-europaea'}
 
 def greet_user(bot, update, user_data):
-    print('Вызван /start')
     update.message.reply_text('Здравствуйте, любитель птичек! На связи Шазам для птиц. Чтобы узнать обо мне, выберите /help. Ползуйтесь /info для получения списка птиц, которых я знаю. Я помогу вам определить птиц Подмосковья по их голосу. Запишите голосовое сообщение с пением птицы, и я помогу вам определить ее вид. Отправьте мне русское или латинское название птицы, и я пришлю запись ее пения.')
 
 
@@ -57,23 +118,35 @@ def birdname(bot, update, user_data):
     except Exception as e:
         print(e)
 
+def wiki_link(species_name):
+    return 'https://ru.wikipedia.org/wiki/' + re.sub('-', '_', species_name)
+
 def receiveMessage(bot, update, user_data):
     try:
         # update.message.reply_text("Обрабатываю данные")
         os.makedirs('downloads', exist_ok=True)
         print(update)
-        voice_file = bot.get_file(update.message.voice.file_id)
-        filename = os.path.join('downloads', '{}.mp3'.format(voice_file.file_id))
+        if update.message.voice:
+            audio = update.message.voice
+        elif update.message.audio:
+            audio = update.message.audio
+        voice_file = bot.get_file(audio.file_id)
+        filename = os.path.join('downloads', '{}.mp3'.format(audio.file_id))
         voice_file.download(filename)
-        species_name = random.choice(list(set(latin_names.values())))
-        # update.message.reply_text()
-        update.message.reply_text('https://ru.wikipedia.org/wiki/' + re.sub('-', '_', species_name))
-        # update.message.reply_text("Файл сохранен")
+        update.message.reply_text('Файл получен, приступаю к обработке')
+        predictions = get_predictions(MODELS, filename)
+        predictions = sorted(predictions.items(), key=lambda bird_prob: bird_prob[1], reverse=True)
+        predicted_birds = [bird_prob for bird_prob in predictions if bird_prob[1] > 0.5]
+        print(predictions)
+
+        if len(predicted_birds) > 0:
+            msgs = [f'{wiki_link(bird_prob[0])} с вероятностью {(bird_prob[1] * 100).round()}%' for bird_prob in predicted_birds]
+            update.message.reply_text('\n'.join(msgs))
+        elif len(predicted_birds) == 0:
+            species_name = predictions[0][0]
+            update.message.reply_text(f'Не узнаю. Но наиболее вероятно, это {wiki_link(species_name)}')
     except Exception as e:
         print(e)
-    #user_voice = update.message.voice
-    #print(user_voice)
-    #update.message.reply_voice(user_voice)
 
 def help_user(bot, update, user_data):
     print('Запрошена помощь /help')
@@ -83,27 +156,7 @@ def info_user(bot, update, user_data):
     print('Информация /info')
     update.message.reply_text('Птицы, которых я знаю:\nЗяблик  (Fringilla coelebs)\nБольшая синица  (Parus major)\nЛазоревка   Cyanistes caeruleus)\nПухляк  (Poecile montanus)\nПолевой жаворонок   (Alauda arvensis)\nЛуговой чекан   (Saxicola rubetra)\nКаменка Oenanthe (oenanthe)\nВаракушка   (Luscinia svecica)\nЧечевица    (Carpodacus erythrinus)\nСорока  (Pica pica)\nСойка   (Garrulus glandarius)\nСерая ворона    (Corvus cornix)\nВорон   (Corvus corax)\nКряква  (Anas platyrhynchos)\nЧайка озерная   (Chroicocephalus ridibundus)\nЗеленушка   (Chloris chloris)\nДрозд белобровик    (Turdus iliacus)\nДрозд рябинник  (Turdus pilaris)\nДрозд черный    (Turdus merula)\nСкворец (Sturnus vulgaris)\nЗарянка (Erithacus rubecula)\nСнегирь (Pyrrhula pyrrhula)\nПоползень   (Sitta europaea)\n')
 
-#def trueMessage(bot, update, user_data):
-    #print(Получил голосовое сообщение)
-    #update.message.reply_text('Похоже, это' +)
-#или:
-#@bot.message_handler(content_types=['voice'])
-#def voice_processing(message):
-    #file_info = bot.get_file(message.voice.file_id)
-    #file = requests.get('https://api.telegram.org/file/bot{0}/{1}'.format(789454327:AAGs4Kzt53E142DzAqJg8-A6rb6kZOrQvXg, file_info.file_path)) 
-
-#def countme(bot, update):
-
-
 if __name__=="__main__":
+    precalculate_optimal_model_params()
+    MODELS = load_models()
     main()
-    #
-
-
-
-
-
-
-
-
-
